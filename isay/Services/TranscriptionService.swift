@@ -45,7 +45,7 @@ actor TranscriptionService {
     private let fieldName  = "audio"        // tên field multipart server mong đợi
     private let session    = URLSession.shared
 
-    init(endpoint: String = "https://your-api.example.com/transcribe") {
+    init(endpoint: String = "http://10.0.0.11:8000/transcribe") {
         // Force-unwrap an toàn vì endpoint là literal tĩnh
         self.endpointURL = URL(string: endpoint)!
     }

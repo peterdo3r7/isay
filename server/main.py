@@ -1,22 +1,24 @@
 import os
-import tempfile
 from contextlib import asynccontextmanager
 
-import openai
+import httpx
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+
+# MARK: - Configuration
+
+WHISPER_URL = os.getenv("WHISPER_URL", "http://10.0.0.11:9000")
 
 
 # MARK: - Lifespan
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Kiểm tra API key khi khởi động
-    if not os.getenv("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY chưa được thiết lập trong file .env")
-    openai.api_key = os.getenv("OPENAI_API_KEY")
+    app.state.http = httpx.AsyncClient(base_url=WHISPER_URL, timeout=60)
     yield
+    await app.state.http.aclose()
 
 
 # MARK: - App
@@ -29,7 +31,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Thu hẹp lại khi deploy production
+    allow_origins=["*"],
     allow_methods=["POST"],
     allow_headers=["*"],
 )
@@ -45,7 +47,6 @@ class TranscriptionResponse(BaseModel):
 
 @app.get("/health")
 async def health():
-    """Kiểm tra server đang chạy."""
     return {"status": "ok"}
 
 
@@ -53,11 +54,10 @@ async def health():
 async def transcribe(audio: UploadFile = File(...)):
     """
     Nhận file audio (m4a/wav/mp3) qua multipart/form-data,
-    gửi lên OpenAI Whisper, trả về văn bản nhận dạng.
+    gửi lên Whisper local, trả về văn bản nhận dạng.
 
     Field name phải là 'audio' — khớp với TranscriptionService.swift.
     """
-    # Kiểm tra định dạng file được chấp nhận
     allowed = {"audio/m4a", "audio/wav", "audio/mpeg", "audio/mp4",
                "audio/x-m4a", "application/octet-stream"}
     if audio.content_type and audio.content_type not in allowed:
@@ -66,31 +66,24 @@ async def transcribe(audio: UploadFile = File(...)):
             detail=f"Định dạng không hỗ trợ: {audio.content_type}",
         )
 
-    # Đọc dữ liệu upload
-    audio_bytes = await audio.read()
+    max_size = 25 * 1024 * 1024
+    audio_bytes = await audio.read(max_size + 1)
     if not audio_bytes:
         raise HTTPException(status_code=400, detail="File audio rỗng.")
+    if len(audio_bytes) > max_size:
+        raise HTTPException(status_code=413, detail="File vượt quá giới hạn 25 MB.")
 
-    # Lưu vào file tạm để gửi lên Whisper API
-    suffix = os.path.splitext(audio.filename or "recording.m4a")[1] or ".m4a"
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
+    filename = audio.filename or "recording.m4a"
 
     try:
-        client = openai.AsyncOpenAI()
-        with open(tmp_path, "rb") as f:
-            response = await client.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="vi",          # Nhận dạng tiếng Việt
-                response_format="text", # Trả về plain text thay vì JSON verbose
-            )
-        # response là string khi response_format="text"
-        text = response.strip() if isinstance(response, str) else response.text.strip()
-        return TranscriptionResponse(text=text)
+        response = await app.state.http.post(
+            "/asr",
+            params={"encode": "true", "task": "transcribe", "language": "vi", "output": "txt"},
+            files={"audio_file": (filename, audio_bytes, audio.content_type or "audio/m4a")},
+        )
+        if response.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Whisper trả về lỗi {response.status_code}.")
+        return TranscriptionResponse(text=response.text.strip())
 
-    except openai.APIError as e:
-        raise HTTPException(status_code=502, detail=f"Lỗi Whisper API: {e.message}")
-    finally:
-        os.unlink(tmp_path)  # Luôn xóa file tạm
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Không kết nối được Whisper: {e}")

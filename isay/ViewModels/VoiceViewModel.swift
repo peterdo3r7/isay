@@ -40,7 +40,13 @@ final class VoiceViewModel: ObservableObject {
     @Published private(set) var voiceState: VoiceState = .idle
     @Published private(set) var permission: MicrophonePermission = .undetermined
     @Published private(set) var transcribedText: String = ""
+    @Published private(set) var isSessionReady: Bool = false
     @Published var showPermissionAlert: Bool = false
+
+    var errorMessage: String? {
+        if case .error(let msg) = voiceState { return msg }
+        return nil
+    }
 
     // MARK: Private
     private let voiceService:         VoiceService
@@ -64,7 +70,12 @@ final class VoiceViewModel: ObservableObject {
         Task {
             let result = await voiceService.requestMicrophonePermission()
             if result == .granted {
-                try? voiceService.configureSession()
+                do {
+                    try voiceService.configureSession()
+                    isSessionReady = true
+                } catch {
+                    isSessionReady = false
+                }
             }
         }
     }
@@ -74,6 +85,7 @@ final class VoiceViewModel: ObservableObject {
         _ = voiceService.stopRecording()
         voiceService.deactivateSession()
         voiceState = .idle
+        isSessionReady = false
     }
 
     // MARK: - Hold-to-Talk actions
